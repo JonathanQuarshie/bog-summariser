@@ -2,6 +2,7 @@
 
 import argparse
 import html
+import json
 import logging
 import re
 from io import BytesIO
@@ -251,6 +252,37 @@ def process_brief(brief: Brief) -> Brief | None:
     return brief
 
 
+# --- Delivery state ---
+def load_seen(path: Path = Path('seen.json')) -> set[str]:
+    """Read previously delivered brief URLs, failing safely on corrupt state.
+
+    Args:
+        path: JSON state file containing a list of URL strings.
+    Returns:
+        Delivered URLs, or an empty set for a first run without a state file.
+    """
+    if not path.exists():
+        return set()
+    data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, list) or any(not isinstance(url, str) for url in data):
+        raise ValueError('Invalid seen.json: expected a list of URL strings')
+    return set(data)
+
+
+def save_seen(urls: set[str], path: Path = Path('seen.json')) -> None:
+    """Atomically persist delivered URLs without truncating the previous state.
+
+    Args:
+        urls: Complete set of successfully delivered brief URLs.
+        path: Destination JSON state file.
+    Returns:
+        None.
+    """
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(sorted(urls), indent=2) + '\n', encoding='utf-8')
+    temporary.replace(path)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Build one digest and send it or save a preview.
 
@@ -268,9 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             required_env('GMAIL_USER')
             required_env('GMAIL_APP_PASSWORD')
-        briefs = extract_data(NEWS_URL)[:MAX_BRIEFS]
+        seen = load_seen()
+        briefs = [brief for brief in extract_data(NEWS_URL)[:MAX_BRIEFS] if brief.url not in seen]
         if not briefs:
-            logger.info('No news briefs found.')
+            logger.info('No new news briefs; nothing to send.')
             return 0
         processed = [result for brief in briefs if (result := process_brief(brief)) is not None]
         if not processed:
@@ -282,7 +315,11 @@ def main(argv: list[str] | None = None) -> int:
             logger.info('Wrote preview.html; no email sent.')
         else:
             send_email(body)
+            # Record seen.json only after successful send so failed sends remain retryable.
+            save_seen(seen | {brief.url for brief in processed})
         return 0
+    except json.JSONDecodeError:
+        logger.error('Invalid seen.json: expected valid JSON.')
     except ValueError as exc:
         logger.error('%s', exc)
     except (requests.RequestException, smtplib.SMTPException, OSError) as exc:
