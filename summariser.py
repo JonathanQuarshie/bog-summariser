@@ -2,6 +2,8 @@
 
 import html
 import logging
+import re
+from io import BytesIO
 import os
 import smtplib
 import ssl
@@ -13,6 +15,7 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
 NEWS_URL = 'https://www.bog.gov.gh/news/'
 HEADERS = {'User-Agent': 'BoG-News-Digest/1.0'}
@@ -60,6 +63,54 @@ def extract_data(url: str) -> list[Brief]:
         briefs.append(Brief(anchor.get_text(' ', strip=True) or 'News brief', brief_url))
     # Original bug: returning inside the loop discarded every subsequent item.
     return briefs
+
+
+def find_pdf_url(page_url: str) -> str | None:
+    """Find the first PDF linked from a brief page.
+
+    Args:
+        page_url: Brief wrapper page URL.
+    Returns:
+        Absolute PDF URL, or None if no PDF is linked.
+    """
+    response = requests.get(page_url, timeout=15, headers=HEADERS)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.content, 'html.parser')
+    for anchor in soup.find_all('a', href=True):
+        href = anchor.get('href')
+        if isinstance(href, str) and urlsplit(href).path.lower().endswith('.pdf'):
+            return urljoin(page_url, href)
+    return None
+
+
+def fetch_pdf_text(pdf_url: str, max_chars: int = 30000) -> str | None:
+    """Download a PDF and extract bounded, whitespace-normalised text.
+
+    Args:
+        pdf_url: Source PDF URL.
+        max_chars: Maximum characters retained for summarisation.
+    Returns:
+        Extracted text, or None for a PDF with no extractable text.
+    """
+    response = requests.get(pdf_url, timeout=15, headers=HEADERS)
+    response.raise_for_status()
+    # Reading in memory avoids temporary files and their cleanup requirements.
+    reader = PdfReader(BytesIO(response.content))
+    # max_chars caps LLM input cost, including for unexpectedly long PDFs.
+    chunks = []
+    remaining = max_chars
+    for page in reader.pages:
+        text = re.sub(r'\s+', ' ', page.extract_text() or '').strip()
+        if text:
+            chunks.append(text[:remaining])
+            remaining -= len(chunks[-1]) + 1
+        if remaining <= 0:
+            break
+    text = ' '.join(chunks)[:max_chars]
+    if not text:
+        logger.warning('Skipping PDF: no extractable text (possibly scanned).')
+        return None
+    return text
 
 
 # --- Email ---
