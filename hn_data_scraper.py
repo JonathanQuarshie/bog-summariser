@@ -1,4 +1,5 @@
 import requests #http requests
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup # scraping
 import smtplib # mail protocol
@@ -17,11 +18,16 @@ def extract_data(url):
     print('Extracting From Data Source...')
     cnt = ''
     cnt +=('<b>Data Extracted:</b>\n'+'<br>'+'-'*50+'<br>')
-    response = requests.get(url)
+    response = requests.get(url, timeout=15, headers={'User-Agent': 'BoG-News-Digest/1.0'})
+    response.raise_for_status()
     content = response.content
     soup = BeautifulSoup(content, 'html.parser')
-    for i,tag in enumerate(soup.find_all('td',attrs={'class':'tittle','valign':''})):
-        cnt += ((str(i+1)+' :: '+ '<a href="' + tag.a.get('href') + '">' + tag.text + 
+    for i,tag in enumerate(soup.find_all('a', href=lambda href: href and '/news_briefs/news-brief-' in href)):
+        if tag.a is None:
+            anchor = tag
+        else:
+            anchor = tag.a
+        cnt += ((str(i+1)+' :: '+ '<a href="' + urljoin(url, anchor.get('href')) + '">' + tag.text + 
                  '</a>' + "\n" + '<br>') if tag.text!='More' else '')
         # print(tag.prettify) #find_all('span' ,attrs={'class':'sitestr'}))
     return(cnt)
