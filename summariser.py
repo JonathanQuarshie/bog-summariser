@@ -1,9 +1,11 @@
-"""Build a Bank of Ghana digest: discover briefs → render HTML → send email."""
+"""Build a Bank of Ghana digest: discover briefs → extract PDFs → summarise → email a digest."""
 
+import argparse
 import html
 import logging
 import re
 from io import BytesIO
+from pathlib import Path
 import os
 import smtplib
 import ssl
@@ -21,6 +23,8 @@ from google.genai import types, errors
 
 NEWS_URL = 'https://www.bog.gov.gh/news/'
 HEADERS = {'User-Agent': 'BoG-News-Digest/1.0'}
+# MAX_BRIEFS bounds API cost and keeps each daily email manageable.
+MAX_BRIEFS = 3
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +34,8 @@ class Brief:
 
     title: str
     url: str
+    pdf_url: str | None = None
+    summary: str | None = None
 
 
 # --- Fetching ---
@@ -152,19 +158,33 @@ def summarise(title: str, text: str) -> str | None:
 
 # --- Email ---
 def build_html(briefs: list[Brief]) -> str:
-    """Render discovered briefs as a safe HTML email.
+    """Render digest sections with escaped summaries and source links.
 
     Args:
-        briefs: Discovered brief titles and URLs.
+        briefs: Processed briefs, including any unavailable summaries.
     Returns:
-        An HTML document suitable for email.
+        An HTML document suitable for email or a browser preview.
     """
-    # Original bug: raw scraped text was concatenated into HTML; escape untrusted text.
-    items = ''.join(
-        f'<li><a href="{html.escape(brief.url, quote=True)}">'
-        f'{html.escape(brief.title)}</a></li>' for brief in briefs
-    )
-    return f'<!doctype html><html><body><h1>Bank of Ghana News</h1><ul>{items}</ul></body></html>'
+    sections = []
+    for brief in briefs:
+        # Original bug: raw scraped text was concatenated into HTML.
+        # html.escape keeps untrusted titles, model output, and URLs inert.
+        title = html.escape(brief.title)
+        if brief.summary:
+            bullets = [line.strip().removeprefix('- ').strip()
+                       for line in brief.summary.splitlines() if line.strip()]
+            content = '<ul>' + ''.join(f'<li>{html.escape(b)}</li>' for b in bullets) + '</ul>'
+        else:
+            content = '<p>No summary available</p>'
+        source = brief.pdf_url or brief.url
+        label = 'Source PDF' if brief.pdf_url else 'Source brief'
+        sections.append(
+            f'<section><h2>{title}</h2>{content}'
+            f'<p><a href="{html.escape(source, quote=True)}">{label}</a></p></section>'
+        )
+    return ('<!doctype html><html><head><meta charset="utf-8">'
+            '<title>Bank of Ghana News Digest</title></head><body>'
+            '<h1>Bank of Ghana News Digest</h1>' + ''.join(sections) + '</body></html>')
 
 
 def required_env(name: str) -> str:
@@ -193,7 +213,7 @@ def send_email(body: str) -> None:
     password = required_env('GMAIL_APP_PASSWORD')
     recipient = os.environ.get('MAIL_TO') or sender
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f'Financial News updates [Automated Email] {datetime.now():%d-%m-%Y}'
+    msg['Subject'] = f'Bank of Ghana News Digest [Automated] {datetime.now():%d-%m-%Y}'
     msg['From'] = sender
     msg['To'] = recipient
     msg.attach(MIMEText(body, 'html', 'utf-8'))
@@ -208,23 +228,60 @@ def send_email(body: str) -> None:
     logger.info('Digest email sent.')
 
 
-def main() -> int:
-    """Discover briefs and send a digest with safe error reporting.
+def process_brief(brief: Brief) -> Brief | None:
+    """Extract and summarise one brief while isolating its failures.
 
     Args:
-        None.
+        brief: Discovered brief to process.
     Returns:
-        Zero on success, one on configuration, HTTP, or SMTP failure.
+        A processed brief, or None when its PDF has no extractable text.
     """
+    try:
+        brief.pdf_url = find_pdf_url(brief.url)
+        if brief.pdf_url:
+            text = fetch_pdf_text(brief.pdf_url)
+            if text is None:
+                return None
+            brief.summary = summarise(brief.title, text)
+        else:
+            logger.warning('Brief has no PDF; using summary fallback.')
+    except Exception as exc:
+        # One malformed PDF or failed request must not discard the other briefs.
+        logger.warning('Brief processing failed (%s); using fallback.', type(exc).__name__)
+    return brief
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build one digest and send it or save a preview.
+
+    Args:
+        argv: Optional CLI arguments; None reads the process arguments.
+    Returns:
+        Zero on success, one on configuration, HTTP, or delivery failure.
+    """
+    parser = argparse.ArgumentParser(description='Bank of Ghana daily news digest')
+    parser.add_argument('--dry-run', action='store_true', help='Write preview.html without sending')
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     try:
-        required_env('GMAIL_USER')
-        required_env('GMAIL_APP_PASSWORD')
-        briefs = extract_data(NEWS_URL)
+        required_env('GEMINI_API_KEY')
+        if not args.dry_run:
+            required_env('GMAIL_USER')
+            required_env('GMAIL_APP_PASSWORD')
+        briefs = extract_data(NEWS_URL)[:MAX_BRIEFS]
         if not briefs:
             logger.info('No news briefs found.')
             return 0
-        send_email(build_html(briefs))
+        processed = [result for brief in briefs if (result := process_brief(brief)) is not None]
+        if not processed:
+            logger.info('No readable briefs to send.')
+            return 0
+        body = build_html(processed)
+        if args.dry_run:
+            Path('preview.html').write_text(body, encoding='utf-8')
+            logger.info('Wrote preview.html; no email sent.')
+        else:
+            send_email(body)
         return 0
     except ValueError as exc:
         logger.error('%s', exc)
