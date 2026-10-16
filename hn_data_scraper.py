@@ -24,7 +24,7 @@ def extract_data(url):
         cnt += ((str(i+1)+' :: '+ '<a href="' + tag.a.get('href') + '">' + tag.text + 
                  '</a>' + "\n" + '<br>') if tag.text!='More' else '')
         # print(tag.prettify) #find_all('span' ,attrs={'class':'sitestr'}))
-        return(cnt)
+    return(cnt)
 
 cnt = extract_data('https://www.bog.gov.gh/news/')
 content += cnt
